@@ -1,0 +1,16 @@
+settings_version: 0.0.4
+datasets_dir: D:\face-car\dashcam_anonymizer-master\datasets
+weights_dir: weights
+runs_dir: runs
+uuid: 9e9a7542a0a881cf595c4865a79687e814ce681f707db8956dc37bfee653f716
+sync: true
+api_key: ''
+clearml: true
+comet: true
+dvc: true
+hub: true
+mlflow: true
+neptune: true
+raytune: true
+tensorboard: true
+wandb: true
