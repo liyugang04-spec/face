@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import shutil
+from pathlib import Path
 import cv2
 import pybboxes as pbx
 import yaml
@@ -13,9 +14,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config", help = "path of the training configuartion file", required = True)
 args = parser.parse_args()
 
-if (os.path.exists("annot_txt")):
-    shutil.rmtree("annot_txt")
-
 #Reading the configuration file
 with open(args.config, 'r', encoding='utf-8-sig') as f:
     try:
@@ -23,58 +21,135 @@ with open(args.config, 'r', encoding='utf-8-sig') as f:
     except yaml.YAMLError as exc:
         print(exc)
 
+issues_folder = config.get("issues_folder")
+issue_log_file = config.get("issue_log_file")
+
 if os.path.exists("runs"):
     shutil.rmtree("runs")
 
-model = YOLO(config["model_path"])
+image_folder = config['images_path']
+image_files = sorted(glob.glob(os.path.join(image_folder, "*" + config["img_format"])))
 
-if(config["gpu_avail"]):
-    _ = model(source=config['images_path'],
+
+def append_issue_log(record):
+    if not issue_log_file:
+        return
+    log_path = Path(issue_log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def copy_to_issues(src_path, issue_type, message, copied=True, exception_text=""):
+    issue_path = ""
+    if issues_folder:
+        issue_dir = Path(issues_folder)
+        issue_dir.mkdir(parents=True, exist_ok=True)
+        dst = issue_dir / Path(src_path).name
+        try:
+            shutil.copy2(src_path, dst)
+            issue_path = str(dst)
+        except Exception as copy_exc:
+            copied = False
+            message = f"{message}; copy_failed={copy_exc}"
+    append_issue_log(
+        {
+            "input_path": str(src_path),
+            "issue_type": issue_type,
+            "message": message,
+            "copied_to_issue_folder": copied and bool(issue_path),
+            "issue_path": issue_path,
+            "exception": exception_text,
+        }
+    )
+
+
+try:
+    model = YOLO(config["model_path"])
+
+    if config["gpu_avail"]:
+        _ = model(
+            source=config['images_path'],
             save=False,
             save_txt=True,
             conf=config['detection_conf_thresh'],
             device='cuda:0',
             project='runs/detect/',
-            name="yolo_images_pred")
-else:
-    _ = model(source=config['images_path'],
+            name="yolo_images_pred",
+        )
+    else:
+        _ = model(
+            source=config['images_path'],
             save=False,
             save_txt=True,
             conf=config['detection_conf_thresh'],
             device='cpu',
             project="runs/detect/",
-            name="yolo_images_pred")
+            name="yolo_images_pred",
+        )
+except Exception as e:
+    print(f"YOLO inference failed: {e}")
+    for image_path in image_files:
+        copy_to_issues(image_path, "inference_failed", "YOLO model initialization or inference failed", exception_text=str(e))
+    raise SystemExit(0)
 
-
-#images = [int(item.split("/")[1].replace(config['img_format'], "")) for item in images]
-images = sorted(glob.glob(config['images_path']+"/*"+config["img_format"]))
-
-os.mkdir("annot_txt")
-
-image_folder = config['images_path']
 annot_dir = f'runs/detect/yolo_images_pred/labels/'
 
-for file in os.listdir(annot_dir):
-    if file.endswith('.txt'):
-        try:
-            image_file = file.replace('.txt', config["img_format"])
-            image_path = os.path.join(image_folder, image_file)
-            image = cv2.imread(image_path)
-            if image is None:
-                print(f"Could not read image for annotation conversion: {image_path}")
-                continue
-            img_height, img_width = image.shape[:2]
-            with open(annot_dir + file, 'r') as fin:
-                for line in fin.readlines():
-                    line = [float(item) for item in line.split()[1:]]
-                    line = pbx.convert_bbox(line, from_type="yolo", to_type="voc", image_size=(img_width, img_height))
-                    data_string = " ".join(str(num) for num in line)
-                    with open(f"annot_txt/{os.path.basename(file)}", "a") as f:
-                        f.write(data_string + "\n")
-        except Exception as e:
-            print(f'{file} conversion failed: {e}')
+image_folder = config['images_path']
+output_folder = config['output_folder']
+
+# Create the output folder if it doesn't exist
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
 
 
+def classify_and_blur(image_path):
+    image_name = os.path.basename(image_path)
+    label_path = os.path.join(annot_dir, Path(image_name).stem + ".txt")
+
+    if not os.path.exists(image_path):
+        copy_to_issues(image_path, "read_failed", "input image path does not exist", copied=False)
+        return
+
+    image = cv2.imread(image_path)
+    if image is None:
+        copy_to_issues(image_path, "read_failed", "cv2.imread returned None")
+        return
+
+    if (not os.path.exists(label_path)) or os.path.getsize(label_path) == 0:
+        copy_to_issues(image_path, "no_detection", "no YOLO detections found")
+        return
+
+    try:
+        bboxes = []
+        with open(label_path, "r", encoding="utf-8") as fin:
+            for line in fin.readlines():
+                values = line.strip().split()
+                if len(values) < 5:
+                    raise ValueError(f"Malformed label line: {line.strip()}")
+                coords = [float(item) for item in values[1:]]
+                img_height, img_width = image.shape[:2]
+                bbox = pbx.convert_bbox(coords, from_type="yolo", to_type="voc", image_size=(img_width, img_height))
+                bboxes.append([int(v) for v in bbox])
+    except Exception as e:
+        copy_to_issues(image_path, "parse_failed", "failed while parsing YOLO label file", exception_text=str(e))
+        return
+
+    try:
+        image = blur_regions(image, bboxes)
+    except Exception as e:
+        copy_to_issues(image_path, "blur_failed", "failed while blurring detected regions", exception_text=str(e))
+        return
+
+    output_file = Path(image_name).stem + '_blurred.jpg'
+    output_path = os.path.join(output_folder, output_file)
+    try:
+        ok = cv2.imwrite(output_path, image)
+        if not ok:
+            raise IOError(f"cv2.imwrite returned False for {output_path}")
+    except Exception as e:
+        copy_to_issues(image_path, "write_failed", "failed while writing blurred output", exception_text=str(e))
+        return
 def blur_regions(image, regions):
     """
     Blurs the image, given the x1,y1,x2,y2 cordinates using Gaussian Blur.
@@ -87,44 +162,11 @@ def blur_regions(image, regions):
         image[y1:y2, x1:x2] = blurred_roi
     return image
 
-txt_folder = 'annot_txt/'
-image_folder = config['images_path']
-output_folder = config['output_folder']
 
-# Create the output folder if it doesn't exist
-if not os.path.exists(output_folder):
-    os.makedirs(output_folder)
-
-# List all text files in the 'dir' folder
-txt_files = [f for f in os.listdir(txt_folder) if f.endswith('.txt')]
-
-for txt_file in txt_files:
-    # Read the text file containing bounding box information
-    with open(os.path.join(txt_folder, txt_file), 'r') as f:
-        lines = f.readlines()
-
-    # Extract bounding box coordinates from the txt file
-    bboxes = []
-    for line in lines:
-        values = line.strip().split()
-        x_min, y_min, x_max, y_max = map(int, values)  # Assuming VOC format with x_min, y_min, x_max, y_max
-        bboxes.append([x_min, y_min, x_max, y_max])
-
-    # Read the corresponding image
-    image_file = txt_file.replace('.txt', config["img_format"])  # Assuming image files have .jpg extension
-    image_path = os.path.join(image_folder, image_file)
-    image = cv2.imread(image_path)
-
-    if image is None:
-        print(f"Could not read image: {image_path}")
-        continue
-
-    # Apply Gaussian blur to each bounding box region once per image
-    image = blur_regions(image, bboxes)
-
-    # Save the blurred image to the output folder
-    output_file = txt_file.replace('.txt', '_blurred.jpg')
-    output_path = os.path.join(output_folder, output_file)
-    cv2.imwrite(output_path, image)
+for image_path in image_files:
+    try:
+        classify_and_blur(image_path)
+    except Exception as e:
+        copy_to_issues(image_path, "unexpected_error", "unexpected error during image processing", exception_text=str(e))
 
 print(f"@@ The bluured images are saved in Directory -------> {config['output_folder']}")
