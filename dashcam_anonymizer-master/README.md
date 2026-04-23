@@ -90,4 +90,14 @@ and please consider,
 
 git add .
 git commit -m "2"
-git push -u origin main
+git push -u origin master
+
+conda activate dashanon_clean
+cd /d D:\face-car\dashcam_anonymizer-master
+set KMP_DUPLICATE_LIB_OK=TRUE
+
+
+python blur_images.py --config configs/img_blur.yaml
+
+
+python blur_images_batch.py --input-root input_root --output-root blurred_root --issues-root issues_root

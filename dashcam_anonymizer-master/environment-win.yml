@@ -1,0 +1,24 @@
+name: dashanon-win
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  - numpy=1.26.*
+  - opencv
+  - pip:
+      - torch==2.0.1
+      - torchvision==0.15.2
+      - ultralytics==8.0.144
+      - pybboxes==0.1.6
+      - pyyaml==6.0.3
+      - pillow
+      - matplotlib
+      - scipy
+      - tqdm
+      - rich
+      - natsort
+      - gdown
